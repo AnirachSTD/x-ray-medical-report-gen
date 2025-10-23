@@ -1,24 +1,28 @@
 
 import React, { useState, useEffect } from 'react';
-import { GoogleGenAI, Chat } from '@google/genai';
-import { UploadedFile } from './types';
-import { getInitialPrompt, getRefinementPrompt } from './services/geminiService';
+import { Chat } from '@google/genai';
+import { UploadedFile, KnowledgeItem } from './types';
+import { getRefinementPrompt, generateReport } from './services/geminiService';
 import FileUpload from './components/FileUpload';
 import ReportDisplay from './components/ReportDisplay';
 import KnowledgeBaseManager from './components/KnowledgeBaseManager';
 import { HeaderIcon } from './components/icons';
 
+type AnalysisStatus = {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  message: string;
+};
+
 const App: React.FC = () => {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [report, setReport] = useState<string>('');
-  const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isRefining, setIsRefining] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
+  const [analysisStatus, setAnalysisStatus] = useState<AnalysisStatus>({ status: 'idle', message: '' });
   const [chatSession, setChatSession] = useState<Chat | null>(null);
   const [doctorFeedback, setDoctorFeedback] = useState<string>('');
-  const [knowledgeBase, setKnowledgeBase] = useState<string[]>([]);
+  const [knowledgeBase, setKnowledgeBase] = useState<KnowledgeItem[]>([]);
 
-  const KNOWLEDGE_BASE_KEY = 'xray_feedback_knowledge_base';
+  const KNOWLEDGE_BASE_KEY = 'xray_feedback_knowledge_base_v2';
 
   useEffect(() => {
     // Load knowledge base from localStorage on initial render
@@ -31,15 +35,39 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const addKnowledge = (newKnowledge: string) => {
-    if (!newKnowledge.trim() || knowledgeBase.includes(newKnowledge.trim())) return;
-    const updatedKnowledgeBase = [...knowledgeBase, newKnowledge.trim()];
+  const addKnowledge = (name: string, content: string) => {
+    if (!content.trim()) return;
+    if (knowledgeBase.some(item => item.content.trim() === content.trim())) return;
+
+    const finalName = name.trim() || `${content.trim().substring(0, 40)}...`;
+
+    const newItem: KnowledgeItem = {
+      id: crypto.randomUUID(),
+      name: finalName,
+      content: content.trim()
+    };
+
+    const updatedKnowledgeBase = [...knowledgeBase, newItem];
     setKnowledgeBase(updatedKnowledgeBase);
     localStorage.setItem(KNOWLEDGE_BASE_KEY, JSON.stringify(updatedKnowledgeBase));
   };
 
-  const removeKnowledge = (indexToRemove: number) => {
-    const updatedKnowledgeBase = knowledgeBase.filter((_, index) => index !== indexToRemove);
+  const removeKnowledge = (idToRemove: string) => {
+    const updatedKnowledgeBase = knowledgeBase.filter(item => item.id !== idToRemove);
+    setKnowledgeBase(updatedKnowledgeBase);
+    localStorage.setItem(KNOWLEDGE_BASE_KEY, JSON.stringify(updatedKnowledgeBase));
+  };
+
+  const updateKnowledge = (idToUpdate: string, newName: string, newContent: string) => {
+    if (!newContent.trim()) return;
+
+    const finalName = newName.trim() || `${newContent.trim().substring(0, 40)}...`;
+
+    const updatedKnowledgeBase = knowledgeBase.map(item => 
+      item.id === idToUpdate 
+        ? { ...item, name: finalName, content: newContent.trim() } 
+        : item
+    );
     setKnowledgeBase(updatedKnowledgeBase);
     localStorage.setItem(KNOWLEDGE_BASE_KEY, JSON.stringify(updatedKnowledgeBase));
   };
@@ -69,106 +97,60 @@ const App: React.FC = () => {
 
   const handleAnalyze = async () => {
     if (uploadedFiles.length === 0) {
-      setError('Please upload at least one X-ray image.');
+      setAnalysisStatus({ status: 'error', message: 'Please upload at least one X-ray image.'});
       return;
     }
 
-    setIsLoading(true);
-    setError(null);
+    setAnalysisStatus({ status: 'loading', message: 'Starting analysis...' });
     setReport('');
     setChatSession(null);
     setDoctorFeedback('');
 
     try {
-      const base64Images = await Promise.all(
-        uploadedFiles.map(async ({ file }) => {
-          const reader = new FileReader();
-          return new Promise<string>((resolve, reject) => {
-            reader.onload = () => {
-                if (typeof reader.result === 'string') {
-                    resolve(reader.result.split(',')[1]);
-                } else {
-                    reject(new Error('Failed to read file as base64'));
-                }
-            };
-            reader.onerror = error => reject(error);
-            reader.readAsDataURL(file);
-          });
-        })
+      const onStatusUpdate = (message: string) => {
+        setAnalysisStatus({ status: 'loading', message });
+      };
+      
+      const { reportText, chatSession: newChatSession } = await generateReport(
+          uploadedFiles,
+          knowledgeBase,
+          onStatusUpdate
       );
+
+      setReport(reportText);
+      setChatSession(newChatSession);
+      setAnalysisStatus({ status: 'success', message: 'Report generated successfully.' });
       
-      const mimeTypes = uploadedFiles.map(f => f.file.type);
-
-      const knowledgeBasePrompt = knowledgeBase.map((fb, i) => `- Item ${i + 1}: ${fb}`).join('\n');
-      const initialPrompt = getInitialPrompt(knowledgeBasePrompt);
-      
-      if (!process.env.API_KEY) {
-        throw new Error("API_KEY environment variable is not set.");
-      }
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const chat = ai.chats.create({ model: 'gemini-2.5-flash' });
-      setChatSession(chat);
-
-      const imageParts = base64Images.map((img, index) => ({
-        inlineData: { data: img, mimeType: mimeTypes[index] },
-      }));
-
-      const MAX_RETRIES = 3;
-      let lastError: any = null;
-
-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        try {
-          const response = await chat.sendMessage({ message: { parts: [{ text: initialPrompt }, ...imageParts] } });
-          setReport(response.text);
-          lastError = null; // Clear error on success
-          break; // Exit loop on success
-        } catch (err: any) {
-          lastError = err;
-          // Check if it's a 503 error
-          if (err.message && (err.message.includes('503') || err.message.toUpperCase().includes('UNAVAILABLE'))) {
-            if (attempt < MAX_RETRIES - 1) {
-              const delay = Math.pow(2, attempt) * 1000; // Exponential backoff
-              setError(`Model is busy. Retrying attempt ${attempt + 2} of ${MAX_RETRIES}...`);
-              await new Promise(resolve => setTimeout(resolve, delay));
-            }
-          } else {
-            // It's a different error, so break immediately
-            throw err;
-          }
-        }
-      }
-
-      if (lastError) {
-        // If the loop finished with an error, it must be the 503 error
-         throw new Error("The AI model is currently overloaded. Please try again later.");
-      }
     } catch (err: any) {
       console.error(err);
-      setError(err.message || 'An error occurred during analysis. Please check the console for details.');
-    } finally {
-      setIsLoading(false);
+      setAnalysisStatus({ status: 'error', message: err.message || 'An unexpected error occurred during analysis.' });
     }
   };
 
   const handleFeedbackSubmit = async () => {
     if (!doctorFeedback.trim() || !chatSession) return;
     setIsRefining(true);
-    setError(null);
+    setAnalysisStatus(prev => ({ ...prev, status: 'idle', message: ''}));
+
     try {
       const refinementPrompt = getRefinementPrompt(doctorFeedback);
       const response = await chatSession.sendMessage({ message: refinementPrompt });
       setReport(response.text);
 
-      addKnowledge(doctorFeedback);
+      addKnowledge('', doctorFeedback); // Add feedback to knowledge base without a specific name
       
       setDoctorFeedback('');
     } catch (err) {
       console.error(err);
-      setError('An error occurred while refining the report. Please check the console.');
+      setAnalysisStatus({ status: 'error', message: 'An error occurred while refining the report. Please check the console.' });
     } finally {
       setIsRefining(false);
     }
   };
+  
+  const sortedKnowledgeBase = [...knowledgeBase].sort((a, b) => 
+    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+  );
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-800">
@@ -189,19 +171,22 @@ const App: React.FC = () => {
               onFilesAdded={addFiles}
               onRemoveFile={handleRemoveFile}
               onAnalyze={handleAnalyze}
-              isLoading={isLoading}
+              isLoading={analysisStatus.status === 'loading'}
+              statusMessage={analysisStatus.status === 'loading' ? analysisStatus.message : ''}
             />
             <KnowledgeBaseManager
-              knowledgeBase={knowledgeBase}
+              knowledgeBase={sortedKnowledgeBase}
               onAddKnowledge={addKnowledge}
               onRemoveKnowledge={removeKnowledge}
+              onUpdateKnowledge={updateKnowledge}
             />
           </div>
           <div className="lg:col-span-3">
             <ReportDisplay 
               report={report}
-              isLoading={isLoading}
-              error={error}
+              isLoading={analysisStatus.status === 'loading'}
+              error={analysisStatus.status === 'error' ? analysisStatus.message : null}
+              statusMessage={analysisStatus.status === 'loading' ? analysisStatus.message : ''}
               feedback={doctorFeedback}
               onFeedbackChange={setDoctorFeedback}
               onFeedbackSubmit={handleFeedbackSubmit}
