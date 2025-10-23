@@ -1,0 +1,5 @@
+{
+  "name": "X-Ray Medical Report Generator",
+  "description": "An AI-powered application to analyze medical X-ray films and generate detailed medical reports. Users can upload one or more X-ray images and export the generated analysis as a PDF.",
+  "requestFramePermissions": []
+}
